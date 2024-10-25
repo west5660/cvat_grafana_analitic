@@ -1,0 +1,281 @@
+import sys
+import os
+import pandas as pd
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
+
+def read_data(filename):
+    # Определяем расширение файла
+    file_text = os.path.splitext(filename)[1].lower()
+
+    # Если это CSV файл
+    if file_text == '.csv':
+        with open(f'data/{filename}', 'r', encoding='utf-8') as file:
+            first_line = file.readline().strip()
+
+        # Проверяем, есть ли строка с `sep=`
+        if 'sep=' in first_line:
+            sep_char = first_line.split('=')[1].strip()
+            data = pd.read_csv(f'data/{filename}', sep=sep_char, skiprows=1)
+        else:
+            try:
+                data = pd.read_csv(f'data/{filename}', sep=',')
+            except pd.errors.ParserError:
+                data = pd.read_csv(f'data/{filename}', sep=';')
+
+    elif file_text == '.xlsx':
+        data = pd.read_excel(f'data/{filename}', sheet_name=0)
+
+    else:
+        raise ValueError(f"Неподдерживаемый формат файла: {file_text}")
+
+    # Преобразуем столбец timestamp в формат datetime, если он есть
+    if 'timestamp' in data.columns:
+        data['timestamp'] = pd.to_datetime(data['timestamp'], errors='coerce')
+
+    return data
+
+def add_rename_scope_column(data):
+    # словарь scope с описаниями
+    rename_mapping = {
+        'click:element': 'клик на элемент на кадре',
+        'update:job': '',
+        'send:working_time': '',
+        'zoom:image': 'работа с кадром',
+        'change:frame': 'смена кадра',
+        'create:comment': 'исправление комментария / валидация',
+        'create:issue': 'Корректировка задания (не разметка)',
+        'drag:object': 'Перенос объекта',
+        'resize:object': 'изменение границ объекта',
+        'update:tracks': 'После save_job фиксируется текущий прогресс разметки',
+        'save:job': 'сохранение',
+        'change:attribute': 'изменение комментария на объекте',
+        'split:objects': 'Разделение объектов',
+        'create:tracks': '',
+        'draw:object': 'Добавление объекта',
+        'create:job': '',
+        'delete:object': 'удаление объекта',
+        'fit:image': 'посадка изображения'
+    }
+
+    # новый столбец rename_scope
+    data['rename_scope'] = data['scope'].map(rename_mapping)
+
+    return data
+
+def select_file():
+    files = [
+        filename for filename in os.listdir('data')
+        if not filename.startswith('~') and (filename.endswith('.xlsx') or filename.endswith('.csv'))
+    ]
+    print('Доступные файлы для обработки:')
+    for i, filename in enumerate(files, 1):
+        print(f"{i}. {filename}")
+    try:
+        choice = int(input('Выберите номер файла для обработки: '))
+        selected_file = files[choice - 1]
+        return selected_file
+    except (ValueError, IndexError):
+        print('Ошибка: Некорректный выбор файла')
+        return None
+
+
+
+def process_full_data_time(data):
+
+    data = data.sort_values(by=['user_email', 'timestamp']).reset_index(drop=True)
+    data = add_rename_scope_column(data)
+    data['total_time'] = data.groupby('user_email')['timestamp'].shift(-1) - data['timestamp']
+    # Для последней строки каждого пользователя задаем NaT
+    last_indices = data.groupby('user_id').tail(1).index
+    data.loc[last_indices, 'total_time'] = pd.NaT
+
+    data['total_time'] = data['total_time'].apply(
+        lambda x: str(pd.to_timedelta(x)).replace('0 days ', '').split('.')[0] if pd.notna(x) else '00:00:00'
+    )
+
+    # Порядок столбцов
+    columns_order = [
+        'scope', 'rename_scope','timestamp', 'total_time',
+        'count', 'project_id', 'task_id', 'job_id', 'user_id', 'user_name',
+        'user_email', 'org_id', 'org_slug', 'payload'
+    ]
+
+    data = data[columns_order]
+    return data
+
+
+
+def process_scope_data(data):
+
+    if 'scope' not in data.columns or 'timestamp' not in data.columns or 'user_id' not in data.columns:
+        print('Ошибка: Не найдены необходимые столбцы (scope, timestamp, user_id)')
+        return None
+
+    data = data.sort_values(by=['user_id', 'timestamp']).reset_index(drop=True)
+    data = add_rename_scope_column(data)
+    results = []
+
+    # Перебираем данные и вычисляем время, потраченное на каждое действие
+    for i in range(len(data) - 1):
+        current_row = data.iloc[i]
+        next_row = data.iloc[i + 1]
+
+        # Проверяем, что действия принадлежат одному и тому же пользователю
+        if current_row['user_id'] == next_row['user_id']:
+            time_spent = (next_row['timestamp'] - current_row['timestamp']).total_seconds()
+        else:
+            time_spent = 0
+
+        results.append({
+            'scope': current_row['scope'],
+            'rename_scope': current_row['rename_scope'],
+            'user_id': current_row['user_id'],
+            'user_name': current_row['user_name'],
+            'user_email': current_row['user_email'],
+            'timestamp': current_row['timestamp'],
+            'time_spent': time_spent
+        })
+
+    last_row = data.iloc[-1]
+    results.append({
+        'scope': last_row['scope'],
+        'rename_scope': last_row['rename_scope'],
+        'user_id': last_row['user_id'],
+        'user_name': last_row['user_name'],
+        'user_email': last_row['user_email'],
+        'timestamp': last_row['timestamp'],
+        'time_spent': None
+    })
+
+    time_df = pd.DataFrame(results)
+
+    scope_summary = time_df.groupby(['scope', 'rename_scope','user_id','user_name','user_email']).agg(
+        total_time=('time_spent', lambda x: x.sum() if x.count() > 0 else 0),  # Сумма потраченного времени
+        event_count=('scope', 'size')  # Количество событий по каждому scope
+    ).reset_index()
+
+    scope_summary['total_time'] = scope_summary['total_time'].fillna(0).astype(int).apply(
+        lambda x: f"{int(x // 3600):02}:{int((x % 3600) // 60):02}:{int(x % 60):02}")
+
+    return scope_summary
+
+
+def process_user_data(data):
+    required_columns = ['user_email', 'scope', 'timestamp', 'job_id', 'task_id','project_id', 'user_name']
+    if not all(col in data.columns for col in required_columns):
+        print("Ошибка: Не найдены все необходимые столбцы")
+        return None
+
+    # Сортируем данные по timestamp
+    data = data.sort_values(by='timestamp').reset_index(drop=True)
+    data = add_rename_scope_column(data)
+    results = []
+
+    # Перебираем данные и вычисляем время, потраченное на каждое действие для каждого пользователя и scope
+    for i in range(len(data) - 1):
+        current_row = data.iloc[i]
+        next_row = data.iloc[i + 1]
+
+        # Проверяем, что действия принадлежат одному и тому же пользователю
+        if current_row['user_id'] == next_row['user_id']:
+            time_spent = (next_row['timestamp'] - current_row['timestamp']).total_seconds()
+        else:
+            time_spent = 0  # Если пользователь отличается, время не учитываем
+
+        # Заполняем результаты для текущей строки
+        results.append({
+            'user_name': current_row['user_name'],
+            'scope': current_row['scope'],
+            'rename_scope': current_row['rename_scope'],
+            'job_id': int(current_row['job_id']) if pd.notna(current_row['job_id']) else None,
+            'task_id': int(current_row['task_id']) if pd.notna(current_row['task_id']) else None,
+            'project_id': int(current_row['project_id']) if pd.notna(current_row['project_id']) else None,
+            'user_email': current_row['user_email'],
+            'timestamp': current_row['timestamp'],
+            'time_spent': time_spent
+        })
+
+    # Обрабатываем последнюю строку отдельно
+    last_row = data.iloc[-1]
+    results.append({
+        'user_name': last_row['user_name'],
+        'scope': last_row['scope'],
+        'rename_scope': last_row['rename_scope'],
+        'job_id': int(last_row['job_id']) if pd.notna(last_row['job_id']) else None,
+        'task_id': int(last_row['task_id']) if pd.notna(last_row['task_id']) else None,
+        'project_id': int(last_row['project_id']) if pd.notna(last_row['project_id']) else None,
+        'user_email': last_row['user_email'],
+        'timestamp': last_row['timestamp'],
+        'time_spent': None  # Для последней строки потраченное время оставляем пустым
+    })
+
+    time_df = pd.DataFrame(results)
+
+    # Суммируем время для каждого уникального пользователя и scope
+    user_summary = time_df.groupby(['user_name', 'user_email', 'scope','rename_scope']).agg(
+        total_time=('time_spent', lambda x: x.sum() if x.count() > 0 else 0),  # Сумма потраченного времени
+        event_count=('scope', 'size'),  # Количество событий по каждому scope
+        job_ids=('job_id', lambda x: ', '.join(map(str, set(int(i) for i in x if pd.notna(i))))),
+        task_ids=('task_id', lambda x: ', '.join(map(str, set(int(i) for i in x if pd.notna(i))))),
+        project_ids=('project_id', lambda x: ', '.join(map(str, set(int(i) for i in x if pd.notna(i)))))
+    ).reset_index()
+
+    # Преобразуем время в формат 'hh:mm:ss'
+    user_summary['total_time'] = user_summary['total_time'].fillna(0).astype(int).apply(
+        lambda x: f"{int(x // 3600):02}:{int((x % 3600) // 60):02}:{int(x % 60):02}"
+    )
+
+    return user_summary
+
+
+def save_summary_to_file(scope_summary, user_summary, full_data_time, original_filename):
+    output_dir = 'out'
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = os.path.splitext(original_filename)[0] + '_summary.xlsx'
+    output_path = os.path.join(output_dir, output_filename)
+
+    with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+        scope_summary.to_excel(writer, sheet_name='Scope Summary', index=False)
+        user_summary.to_excel(writer, sheet_name='User Summary', index=False)
+        full_data_time.to_excel(writer, sheet_name='Full Data Time', index=False)
+
+    # Открываем файл openpyxl для обработки
+    wb = load_workbook(output_path)
+
+    # Задаем цвет для строк
+    fill_color = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+
+    # Функция для покраски строк на листе
+    def color_rows(ws):
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            scope_cell = row[0]  # Первый столбец
+            if scope_cell.value == 'change:frame':  # Условие для окрашивания строк
+                for cell in row:
+                    cell.fill = fill_color
+
+    # Применяем стилизацию к листу "Full Data Time"
+    ws = wb['Full Data Time']
+    color_rows(ws)  # Красим строки, где scope == 'change:frame'
+    # Сохраняем файл после стилизации
+    wb.save(output_path)
+    print(f"Сводная таблица сохранена в файл: {output_path}")
+
+def main():
+    selected_file = select_file()
+    if selected_file:
+        data = read_data(selected_file)
+        if data is not None:
+            print("Данные успешно загружены и готовы для обработки.")
+            # print(data.head())
+        else:
+            print("Не удалось загрузить данные.")
+
+    scope_summary = process_scope_data(data)
+    user_summary = process_user_data(data)
+    full_data_time = process_full_data_time(data)
+    if scope_summary is not None and user_summary is not None:
+        save_summary_to_file(scope_summary, user_summary, full_data_time, selected_file)
+
+if __name__ == "__main__":
+    main()
